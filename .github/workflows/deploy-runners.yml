@@ -1,30 +1,98 @@
 name: build and deploy runner github
- 
+
 on:
   push:
     branches: ["main"]
- 
+  workflow_dispatch: {}
+  repository_dispatch: {}
+
 env:
   VERSION_DOCKER: ${{vars.VERSION_DOCKER}}
- 
+  AWS_REGION: ${{vars.AWS_REGION}}
+  AWS_ECR: ${{vars.AWS_ECR}}
+  REPO: ${{vars.REPO}}
+  PAYLOAD_NOMBRE_REPO: ${{github.event.client_payload.nombre_repo }}
+
 jobs:
   build-docker:
     runs-on: ubuntu-latest
     steps:
-     
+      
       - name: Checkout
         uses: actions/checkout@v5
- 
+
       #- name: build de docker sin action
       #  run: |
-      #    docker build -t mi-runner-de-github:${{ env.VERSION_DOCKER }} .
- 
+      #    docker build -t ${{ env.AWS_ECR}}:mi-runner-de-github-pedro${{ env.VERSION_DOCKER }} .
+      #    docker push ${{ env.AWS_ECR}}:mi-runner-de-github-pedro${{ env.VERSION_DOCKER }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: detecta cambio en Dockerfile
+        id: dockerfile_changed
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            dockerfile:
+              - 'Dockerfile'
+
       - name: Build and push
+        if: ${{ steps.dockerfile_changed.outputs.dockerfile == 'true' && github.event_name != 'repository_dispatch' && github.event_name != 'workflow_dispatch' }}
         uses: docker/build-push-action@v6
         with:
-          push: false
-          tags: mi-runner-de-github:${{ env.VERSION_DOCKER }}
- 
+          push: true
+          #tags: mi-runner-de-github:${{ env.VERSION_DOCKER }}
+          tags: ${{ env.AWS_ECR}}:mi-runner-de-github-pedro${{ env.VERSION_DOCKER }}
+      
       - name: Verify image
+        if: steps.dockerfile_changed.outputs.dockerfile == 'true'
         run: |
             docker images
+
+      - name: create registrtion runner token
+        id: create_token
+        run: |
+            curl -XPOST -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.PERSONAL_GITHUB_TOKEN }}" https://api.github.com/repos/${{env.REPO}}/actions/runners/registration-token > token.txt
+            cat token.txt
+            TOKEN=$(jq -r '.token' token.txt)
+            ## echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+            echo "runner_token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Copy artifact to server
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.ID_RSA }}
+          port: ${{ secrets.PORT }}
+          source: ./docker-compose.yml
+          target: /home/ubuntu/${{env.REPO}}
+
+      - name: Execute remote SSH commands using SSH key
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.ID_RSA }}
+          port: ${{ secrets.PORT }}
+          script: |
+            cd /home/ubuntu/${{env.REPO}} && \
+            sed -i "s|runner-docker-1|${{env.AWS_ECR}}:mi-runner-de-github-pedro${{env.VERSION_DOCKER}}|g" docker-compose.yml && \
+            sed -i "s|ejemplo-organizacion-sms|${{env.REPO}}|g" docker-compose.yml && \
+            sed -i "s|XXXXXXXXX|${{ steps.create_token.outputs.runner_token }}|g" docker-compose.yml && \
+            sed -i "s|runner-docker|runner-docker-automatico-${{ github.run_id }}|g" docker-compose.yml && \
+            sed -i "s|yyyyyyyyy|runner-docker-automatico-${{ github.run_id }}|g" docker-compose.yml && \
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" && \
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" && \   
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR}}:mi-runner-de-github-pedro${{ env.VERSION_DOCKER }} && \
+            docker compose up -d && \
+            docker ps -a    
